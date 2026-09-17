@@ -1,0 +1,186 @@
+#define _POSIX_C_SOURCE 200809L
+
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#define BUF_SIZE 8192
+#define DEST_MODE 0600
+
+static void write_err(const char *msg)
+{
+    const char *p;
+    size_t n;
+
+    if (msg == NULL) {
+        return;
+    }
+
+    n = 0;
+    for (p = msg; p[n] != '\0'; n++) {
+        /* strlen without pulling in extra library usage beyond the loop */
+    }
+
+    while (n > 0) {
+        ssize_t w = write(STDERR_FILENO, msg, n);
+        if (w < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return;
+        }
+        if (w == 0) {
+            return;
+        }
+        msg += w;
+        n -= (size_t)w;
+    }
+}
+
+static int open_eintr(const char *path, int flags, mode_t mode)
+{
+    int fd;
+
+    do {
+        fd = open(path, flags, mode);
+    } while (fd < 0 && errno == EINTR);
+
+    return fd;
+}
+
+static int close_eintr(int fd)
+{
+    int rc;
+
+    do {
+        rc = close(fd);
+    } while (rc < 0 && errno == EINTR);
+
+    return rc;
+}
+
+static int write_all(int fd, const char *buf, size_t n)
+{
+    while (n > 0) {
+        ssize_t w = write(fd, buf, n);
+        if (w < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (w == 0) {
+            errno = EIO;
+            return -1;
+        }
+        buf += w;
+        n -= (size_t)w;
+    }
+
+    return 0;
+}
+
+static int copy_fd(int src_fd, int dst_fd)
+{
+    char buf[BUF_SIZE];
+
+    for (;;) {
+        ssize_t nread = read(src_fd, buf, sizeof(buf));
+        if (nread < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (nread == 0) {
+            return 0;
+        }
+        if (write_all(dst_fd, buf, (size_t)nread) < 0) {
+            return -1;
+        }
+    }
+}
+
+static int paths_equal(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL) {
+        return 0;
+    }
+
+    while (*a != '\0' && *a == *b) {
+        a++;
+        b++;
+    }
+
+    return *a == *b;
+}
+
+int main(int argc, char *argv[])
+{
+    int src_fd = -1;
+    int dst_fd = -1;
+    int status = 1;
+
+    if (argc != 3) {
+        write_err("usage: ");
+        if (argc > 0 && argv[0] != NULL && argv[0][0] != '\0') {
+            write_err(argv[0]);
+        } else {
+            write_err("filecopy");
+        }
+        write_err(" <source> <destination>\n");
+        return 1;
+    }
+
+    if (argv[1] == NULL || argv[1][0] == '\0' ||
+        argv[2] == NULL || argv[2][0] == '\0') {
+        write_err("error: source and destination paths must be non-empty\n");
+        return 1;
+    }
+
+    if (paths_equal(argv[1], argv[2])) {
+        write_err("error: source and destination must be different paths\n");
+        return 1;
+    }
+
+    src_fd = open_eintr(argv[1], O_RDONLY, 0);
+    if (src_fd < 0) {
+        write_err("error: cannot open source file\n");
+        goto cleanup;
+    }
+
+    dst_fd = open_eintr(argv[2], O_WRONLY | O_CREAT | O_EXCL, DEST_MODE);
+    if (dst_fd < 0) {
+        if (errno == EEXIST) {
+            write_err("error: destination file already exists\n");
+        } else {
+            write_err("error: cannot create destination file\n");
+        }
+        goto cleanup;
+    }
+
+    if (copy_fd(src_fd, dst_fd) < 0) {
+        write_err("error: copy failed\n");
+        goto cleanup;
+    }
+
+    status = 0;
+
+cleanup:
+    if (dst_fd >= 0) {
+        if (close_eintr(dst_fd) < 0 && status == 0) {
+            write_err("error: failed to close destination file\n");
+            status = 1;
+        }
+        dst_fd = -1;
+    }
+    if (src_fd >= 0) {
+        if (close_eintr(src_fd) < 0 && status == 0) {
+            write_err("error: failed to close source file\n");
+            status = 1;
+        }
+        src_fd = -1;
+    }
+
+    return status;
+}
