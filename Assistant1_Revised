@@ -1,0 +1,216 @@
+//Includes necessary libraries.
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+//Writes the message to standard error.
+static void write_message(const char *message, size_t length)
+{
+    size_t offset = 0;
+
+    while (offset < length) {
+        ssize_t result = write(STDERR_FILENO, message + offset, length - offset);
+
+        if (result > 0) {
+            offset += (size_t)result;
+        } else if (result < 0 && errno == EINTR) {
+            //Retries if it is interrupted.
+            continue;
+        } else {
+            break;
+        }
+    }
+}
+//Opens the source file so it can be read
+static int open_source(const char *path)
+{
+    int source_fd = -1;
+    do {
+        source_fd = open(path, O_RDONLY);
+    } while (source_fd < 0 && errno == EINTR);
+    if (source_fd < 0) {
+        write_message("Error: cannot open source file\n",
+                      sizeof("Error: cannot open source file\n") - 1);
+    }
+    return source_fd;
+}
+//Opens the destination file so it can be written to.
+static int open_destination(const char *path)
+{
+    int destination_fd = -1;
+    do {
+        destination_fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    } while (destination_fd < 0 && errno == EINTR);
+    if (destination_fd < 0) {
+        write_message("Error: cannot create destination file\n",
+                      sizeof("Error: cannot create destination file\n") - 1);
+    }
+    return destination_fd;
+}
+//Closes the source file if the destination file fails to open.
+static void close_source_on_error(int source_fd)
+{
+    int exit_status;
+    do {
+        exit_status = close(source_fd);
+    } while (exit_status < 0 && errno == EINTR);
+}
+//Copies all bytes from source into destination using buffer.
+static int copy_file(int source_fd, int destination_fd, char *buffer, size_t buffer_size)
+{
+    int exit_status = 1;
+    for (;;) {
+        ssize_t bytes_read;
+        //Reads the next chunk, retrying if interrupted.
+        do {
+            bytes_read = read(source_fd, buffer, buffer_size);
+        } while (bytes_read < 0 && errno == EINTR);
+        if (bytes_read == 0) {
+            //End of file. This means the copy completed successfully.
+            exit_status = 0;
+            break;
+        }
+        if (bytes_read < 0) {
+            write_message("Error: cannot read source file\n",
+                          sizeof("Error: cannot read source file\n") - 1);
+            break;
+        }
+        {
+            ssize_t bytes_written = 0;
+            //Writes the chunk.
+            while (bytes_written < bytes_read) {
+                ssize_t result = write(destination_fd,
+                                        buffer + bytes_written,
+                                        (size_t)(bytes_read - bytes_written));
+                if (result > 0) {
+                    bytes_written += result;
+                } else if (result < 0 && errno == EINTR) {
+                    continue;
+                } else {
+                    write_message("Error: cannot write destination file\n",
+                                  sizeof("Error: cannot write destination file\n") - 1);
+                    return exit_status;
+                }
+            }
+        }
+    }
+    return exit_status;
+}
+//Closes both files and reports any close errors.
+static int close_files(int source_fd, int destination_fd, int exit_status)
+{
+    int close_result;
+    do {
+        close_result = close(destination_fd);
+    } while (close_result < 0 && errno == EINTR);
+    if (close_result < 0) {
+        write_message("Error: cannot close destination file\n",
+                      sizeof("Error: cannot close destination file\n") - 1);
+        exit_status = 1;
+    }
+    do {
+        close_result = close(source_fd);
+    } while (close_result < 0 && errno == EINTR);
+    if (close_result < 0) {
+        write_message("Error: cannot close source file\n",
+                      sizeof("Error: cannot close source file\n") - 1);
+        exit_status = 1;
+    }
+    return exit_status;
+}
+
+int main(int argc, char *argv[])
+{
+    int source_fd = -1;
+    int destination_fd = -1;
+    int exit_status = 1;
+    char buffer[4096];
+
+    if (argc != 3) {
+        write_message("Usage: copy SOURCE DESTINATION\n",
+                      sizeof("Usage: copy SOURCE DESTINATION\n") - 1);
+        return 1;
+    }
+    source_fd = open_source(argv[1]);
+    if (source_fd < 0) {
+        return 1;
+    }
+
+    destination_fd = open_destination(argv[2]);
+    if (destination_fd < 0) {
+        do {
+            exit_status = close(source_fd);
+        } while (exit_status < 0 && errno == EINTR);
+        return 1;
+    }
+    exit_status = copy_file(source_fd, destination_fd, buffer, sizeof(buffer));
+    exit_status = close_files(source_fd, destination_fd, exit_status);
+
+    /*for (;;) {
+        ssize_t bytes_read;
+
+        do {
+            bytes_read = read(source_fd, buffer, sizeof(buffer));
+        } while (bytes_read < 0 && errno == EINTR);
+
+        if (bytes_read == 0) {
+            exit_status = 0;
+            break;
+        }
+
+        if (bytes_read < 0) {
+            write_message("Error: cannot read source file\n",
+                          sizeof("Error: cannot read source file\n") - 1);
+            break;
+        }
+
+        {
+            ssize_t bytes_written = 0;
+
+            while (bytes_written < bytes_read) {
+                ssize_t result = write(destination_fd,
+                                        buffer + bytes_written,
+                                        (size_t)(bytes_read - bytes_written));
+
+                if (result > 0) {
+                    bytes_written += result;
+                } else if (result < 0 && errno == EINTR) {
+                    continue;
+                } else {
+                    write_message("Error: cannot write destination file\n",
+                                  sizeof("Error: cannot write destination file\n") - 1);
+                    goto cleanup;
+                }
+            }
+        }
+    }*/
+
+cleanup:
+    {
+        int close_result;
+        close_result = close(destination_fd);
+        if (close_result < 0) {
+            write_message ("Error: cannot close destination file\n",
+                          sizeof("Error: cannot close destination file\n") - 1);
+            exit_status = 1;
+        }
+
+        /*do {
+            close_result = close(destination_fd);
+        } while (close_result < 0 && errno == EINTR);
+        if (close_result < 0) {
+            write_message("Error: cannot close destination file\n",
+                          sizeof("Error: cannot close destination file\n") - 1);
+            exit_status = 1;
+        }*/
+
+        close_result = close(source_fd);
+if (close_result < 0) {
+    write_message("Error: cannot close source file\n",
+                  sizeof("Error: cannot close source file\n") - 1);
+    exit_status = 1;
+}
+    }
+
+    return exit_status;
+}
